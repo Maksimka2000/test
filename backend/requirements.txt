@@ -1,0 +1,6 @@
+fastapi==0.115.6
+uvicorn==0.34.0
+python-multipart==0.0.20
+pyyaml==6.0.2
+playwright==1.49.1
+2captcha-python==1.5.1

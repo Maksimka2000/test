@@ -1,0 +1,762 @@
+openapi: "3.1.0"
+info:
+  title: Bulk Report Submission API
+  version: "1.0.0"
+  description: |
+    Queue bulk abuse reports. Each job has one submission type, one threat
+    type, one reason, and one evidence file, applied to every unique target.
+
+    The server rejects the whole request if any target has the wrong shape,
+    if the evidence is not a JPEG, PNG, or PDF within the size limit, or if
+    the batch is over the cap. Blank lines are ignored. Remaining lines are
+    normalized and de-duplicated. Nothing is stored when validation fails.
+
+    One worker finishes the current row, then takes the pending row from the
+    newest batch. GET /queue lists every target, newest batch first.
+    It opens FORM_URL, fills the report, and waits. CAPTCHA_STRATEGY=manual
+    blocks until the operator solves the captcha. CAPTCHA_STRATEGY=auto asks
+    2Captcha for a token and writes it into g-recaptcha-response. The worker
+    submits, stores the CF code, and only then takes the next row. Transient
+    failures are retried
+    up to MAX_ATTEMPTS with backoff. Rows left in running, retrying, or
+    awaiting_captcha return to pending on startup with their attempt count
+    kept. Pause finishes the current row and does not start another. Skip
+    closes the current page and moves on.
+
+    This document is the source of truth. The server loads batch size,
+    evidence rules, and the enums below from this file, and serves this
+    document at /openapi.json.
+  x-limits:
+    maxBatchSize: 500
+    maxEvidenceBytes: 2097152
+    maxUrlLength: 2048
+    allowedEvidenceTypes:
+      - image/jpeg
+      - image/png
+      - application/pdf
+servers:
+  - url: http://localhost:8000
+    description: API port published by docker compose
+tags:
+  - name: jobs
+    description: Create a batch, read per-target status, and retry failures.
+  - name: meta
+    description: Process health and the limits from this contract.
+paths:
+  /queue:
+    get:
+      tags: [jobs]
+      operationId: getQueue
+      summary: List every queued target, newest batch first.
+      responses:
+        "200":
+          description: The full queue.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Queue"
+  /queue/retry-failed:
+    post:
+      tags: [jobs]
+      operationId: retryAllFailed
+      summary: Re-queue every failed target, across all batches.
+      responses:
+        "200":
+          description: The queue after failed rows returned to pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Queue"
+        "409":
+          description: No failed targets to re-queue.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /jobs:
+    post:
+      tags: [jobs]
+      operationId: createJob
+      summary: Validate a batch and queue one report per unique target.
+      description: |
+        Multipart body. Targets are checked against submission_type.
+        One invalid line, a bad evidence file, or a batch over the cap
+        rejects the request and stores nothing.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - submission_type
+                - targets
+                - threat_type
+                - reason
+                - evidence
+              properties:
+                submission_type:
+                  $ref: "#/components/schemas/SubmissionType"
+                targets:
+                  $ref: "#/components/schemas/TargetsText"
+                threat_type:
+                  $ref: "#/components/schemas/ThreatType"
+                reason:
+                  $ref: "#/components/schemas/Reason"
+                evidence:
+                  type: string
+                  format: binary
+                  description: |
+                    JPEG, PNG, or PDF. The filename must end in .jpg, .jpeg,
+                    .png, or .pdf, and that extension must match the content
+                    signature. Declared Content-Type must match the signature,
+                    or be application/octet-stream. image/jpg is accepted as
+                    image/jpeg. Maximum size is 2097152 bytes (2 MiB).
+            encoding:
+              submission_type:
+                contentType: text/plain
+              targets:
+                contentType: text/plain
+              threat_type:
+                contentType: text/plain
+              reason:
+                contentType: text/plain
+              evidence:
+                contentType: application/octet-stream
+      responses:
+        "201":
+          description: The job was stored. Every target starts pending.
+          headers:
+            Location:
+              description: Path of the new job.
+              schema:
+                type: string
+              example: /jobs/7c1b7a2e-4e5f-4a1c-9c2d-0b6e5f4a1c9d
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "415":
+          description: The body is not multipart/form-data.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorMessage"
+              example:
+                detail: Content-Type must be multipart/form-data.
+        "422":
+          description: Validation failed. Nothing was stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                detail:
+                  - loc: ["body", "targets", 2]
+                    msg: Not a domain. This value looks like a URL.
+                    type: value_error.target
+  /jobs/{id}:
+    get:
+      tags: [jobs]
+      operationId: getJob
+      summary: Fetch a job and the status of each target.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job, including one entry per unique target.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          description: The path id is not a UUID.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /jobs/{id}/retry:
+    post:
+      tags: [jobs]
+      operationId: retryFailedTargets
+      summary: Re-queue only the failed targets.
+      description: |
+        Failed targets return to pending. Their error is cleared and their
+        attempt count is kept. Every other status stays as it is.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: At least one failed target was re-queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The job exists and has no failed targets.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorMessage"
+              example:
+                detail: No failed targets to re-queue.
+        "422":
+          description: The path id is not a UUID.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /jobs/{id}/retry-failed:
+    post:
+      tags: [jobs]
+      operationId: retryAllFailed
+      summary: Re-queue every failed target on the job.
+      description: Same behavior as POST /jobs/{id}/retry.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: At least one failed target was re-queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The job exists and has no failed targets.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorMessage"
+              example:
+                detail: No failed targets to re-queue.
+        "422":
+          description: The path id is not a UUID.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /jobs/{id}/pause:
+    post:
+      tags: [jobs]
+      operationId: pauseJob
+      summary: Stop the worker from starting another row on this job.
+      description: The row already in progress is allowed to finish.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job is paused.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          description: The path id is not a UUID.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /jobs/{id}/resume:
+    post:
+      tags: [jobs]
+      operationId: resumeJob
+      summary: Let the worker take pending rows from this job again.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job is running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          description: The path id is not a UUID.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /targets/{id}/skip:
+    post:
+      tags: [jobs]
+      operationId: skipTarget
+      summary: Skip one target.
+      description: |
+        A pending target becomes skipped immediately. A running, awaiting_captcha,
+        or retrying target is flagged so the worker closes the page and moves on.
+        Submitted and failed targets cannot be skipped.
+      parameters:
+        - $ref: "#/components/parameters/TargetId"
+      responses:
+        "200":
+          description: The target is skipped, or the worker has been asked to skip it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          description: No target has this id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorMessage"
+              example:
+                detail: Target not found.
+        "409":
+          description: This target is submitted or failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorMessage"
+              example:
+                detail: This target cannot be skipped.
+        "422":
+          description: The path id is not a positive integer.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /targets/{id}/retry:
+    post:
+      tags: [jobs]
+      operationId: retryTarget
+      summary: Put one failed or skipped target back on the queue.
+      description: The attempt count is kept and the error is cleared.
+      parameters:
+        - $ref: "#/components/parameters/TargetId"
+      responses:
+        "200":
+          description: The target is pending again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          description: No target has this id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorMessage"
+              example:
+                detail: Target not found.
+        "409":
+          description: The target is not failed or skipped.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorMessage"
+              example:
+                detail: This target cannot be retried.
+        "422":
+          description: The path id is not a positive integer.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /health:
+    get:
+      tags: [meta]
+      operationId: getHealth
+      summary: Liveness plus the limits and enums from this contract.
+      responses:
+        "200":
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+components:
+  parameters:
+    JobId:
+      name: id
+      in: path
+      required: true
+      description: UUID returned by POST /jobs.
+      schema:
+        type: string
+        format: uuid
+    TargetId:
+      name: id
+      in: path
+      required: true
+      description: Target id from the job document.
+      schema:
+        type: integer
+        minimum: 1
+  responses:
+    NotFound:
+      description: No job has this id.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorMessage"
+          example:
+            detail: Job not found.
+  schemas:
+    SubmissionType:
+      type: string
+      description: |
+        domain — a hostname with at least two labels, no scheme, path, or port.
+        ip — an IPv4 or IPv6 address, with no port.
+        url — an absolute http or https URL.
+      enum: [domain, ip, url]
+    ThreatType:
+      type: string
+      description: Why the targets are being reported.
+      enum: [phishing, malware, scam, spam, c2, other]
+    Reason:
+      type: string
+      minLength: 1
+      maxLength: 4000
+      description: Explanation applied to every target in the job. Trimmed.
+    TargetsText:
+      type: string
+      minLength: 1
+      maxLength: 512000
+      description: |
+        One target per line. Blank lines are ignored and do not count toward
+        the batch cap. The server trims each line, normalizes it, and drops
+        later duplicates of the same normalized value. The first line wins,
+        and original order is kept. At most 500 non-empty lines.
+
+        domain — trim, strip one trailing dot, lowercase, convert to IDNA
+        A-labels. At least two dot-separated labels. No scheme, path, port,
+        or IP address.
+        ip — IPv4 or IPv6, optional surrounding brackets. Stored in canonical
+        compressed form. No port, zone, or prefix.
+        url — http or https only, no username or password. Host is lowercased
+        and IDNA-encoded; IPv6 is compressed. Default ports 80 and 443 are
+        removed. An empty path becomes /. The fragment is removed. The query
+        is preserved as written. Maximum 2048 characters.
+
+        If any non-blank line does not match submission_type, the request
+        fails and no job is created.
+    TargetStatusValue:
+      type: string
+      description: |
+        pending — waiting for the single worker.
+        running — the worker is opening the form for this row.
+        awaiting_captcha — the form is filled and the worker is waiting.
+        retrying — a transient error is waiting out its backoff.
+        submitted — the confirmation page returned a CF code.
+        failed — this row stopped with a readable reason.
+        skipped — the operator told the worker to move on.
+      enum: [pending, running, awaiting_captcha, retrying, submitted, failed, skipped]
+    Evidence:
+      type: object
+      additionalProperties: false
+      required: [filename, media_type, size_bytes]
+      properties:
+        filename:
+          type: string
+          description: Basename only, with the extension lowercased.
+        media_type:
+          type: string
+          enum: [image/jpeg, image/png, application/pdf]
+        size_bytes:
+          type: integer
+          minimum: 1
+          maximum: 2097152
+    JobSummary:
+      type: object
+      additionalProperties: false
+      required: [total, pending, running, awaiting_captcha, retrying, submitted, failed, skipped, duplicates_removed]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+          description: Unique targets stored on the job.
+        pending:
+          type: integer
+          minimum: 0
+        running:
+          type: integer
+          minimum: 0
+        awaiting_captcha:
+          type: integer
+          minimum: 0
+        retrying:
+          type: integer
+          minimum: 0
+        submitted:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        skipped:
+          type: integer
+          minimum: 0
+        duplicates_removed:
+          type: integer
+          minimum: 0
+          description: Non-empty lines dropped because their normalized form was already in the batch.
+    Target:
+      type: object
+      additionalProperties: false
+      required: [id, position, input, value, status, attempts, error, confirmation_code]
+      properties:
+        id:
+          type: integer
+          minimum: 1
+          description: Stable id used by skip and retry.
+        position:
+          type: integer
+          minimum: 1
+          description: 1-based order after de-duplication.
+        input:
+          type: string
+          description: Trimmed line as submitted, from the first occurrence.
+        value:
+          type: string
+          description: Normalized value that was queued and used for de-duplication.
+        status:
+          $ref: "#/components/schemas/TargetStatusValue"
+        attempts:
+          type: integer
+          minimum: 0
+          description: How many times the worker has tried this target. Retry does not increment it.
+        error:
+          type: ["string", "null"]
+          description: Present when status is failed. Cleared when the target is re-queued.
+        confirmation_code:
+          type: ["string", "null"]
+          description: CF code from the confirmation page. Present when status is submitted.
+    Queue:
+      type: object
+      additionalProperties: false
+      required: [max_attempts, captcha_timeout_seconds, summary, targets]
+      properties:
+        max_attempts:
+          type: integer
+          minimum: 1
+        captcha_timeout_seconds:
+          type: integer
+          minimum: 1
+          description: How long one captcha attempt may stay in awaiting_captcha.
+        summary:
+          $ref: "#/components/schemas/JobSummary"
+        targets:
+          type: array
+          description: Newest batch first. Lines inside a batch keep their original order.
+          items:
+            $ref: "#/components/schemas/QueueTarget"
+    QueueTarget:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - job_id
+        - position
+        - input
+        - value
+        - status
+        - attempts
+        - error
+        - confirmation_code
+        - paused
+        - queued_at
+        - timeout_seconds
+      properties:
+        id:
+          type: integer
+          minimum: 1
+        job_id:
+          type: string
+          format: uuid
+        position:
+          type: integer
+          minimum: 1
+        input:
+          type: string
+        value:
+          type: string
+        status:
+          $ref: "#/components/schemas/TargetStatusValue"
+        attempts:
+          type: integer
+          minimum: 0
+        error:
+          type: ["string", "null"]
+        confirmation_code:
+          type: ["string", "null"]
+        paused:
+          type: boolean
+        queued_at:
+          type: string
+          format: date-time
+        timeout_seconds:
+          type: ["integer", "null"]
+          minimum: 0
+          description: Seconds left on the captcha wait or the retry backoff. Null when the row is not on a timer.
+    Job:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - submission_type
+        - threat_type
+        - reason
+        - evidence
+        - created_at
+        - summary
+        - targets
+        - paused
+        - max_attempts
+      properties:
+        id:
+          type: string
+          format: uuid
+        submission_type:
+          $ref: "#/components/schemas/SubmissionType"
+        threat_type:
+          $ref: "#/components/schemas/ThreatType"
+        reason:
+          type: string
+        evidence:
+          $ref: "#/components/schemas/Evidence"
+        created_at:
+          type: string
+          format: date-time
+          description: UTC timestamp with a Z suffix.
+        paused:
+          type: boolean
+          description: When true, the worker finishes the current row and does not start another from this job.
+        max_attempts:
+          type: integer
+          minimum: 1
+          description: How many tries one target gets before a transient error becomes failed.
+        summary:
+          $ref: "#/components/schemas/JobSummary"
+        targets:
+          type: array
+          items:
+            $ref: "#/components/schemas/Target"
+      example:
+        id: 7c1b7a2e-4e5f-4a1c-9c2d-0b6e5f4a1c9d
+        submission_type: domain
+        threat_type: phishing
+        reason: Credential form impersonating a bank.
+        evidence:
+          filename: landing.png
+          media_type: image/png
+          size_bytes: 20480
+        created_at: "2026-11-21T09:30:00Z"
+        paused: false
+        max_attempts: 3
+        summary:
+          total: 1
+          pending: 1
+          running: 0
+          awaiting_captcha: 0
+          retrying: 0
+          submitted: 0
+          failed: 0
+          skipped: 0
+          duplicates_removed: 1
+        targets:
+          - id: 1
+            position: 1
+            input: Phish.Example.
+            value: phish.example
+            status: pending
+            attempts: 0
+            error: null
+            confirmation_code: null
+    Limits:
+      type: object
+      additionalProperties: false
+      required:
+        - maxBatchSize
+        - maxEvidenceBytes
+        - maxReasonLength
+        - maxTargetsChars
+        - maxUrlLength
+        - allowedEvidenceTypes
+      properties:
+        maxBatchSize:
+          type: integer
+        maxEvidenceBytes:
+          type: integer
+        maxReasonLength:
+          type: integer
+        maxTargetsChars:
+          type: integer
+        maxUrlLength:
+          type: integer
+        allowedEvidenceTypes:
+          type: array
+          items:
+            type: string
+    Enums:
+      type: object
+      additionalProperties: false
+      required: [submissionType, threatType]
+      properties:
+        submissionType:
+          type: array
+          items:
+            $ref: "#/components/schemas/SubmissionType"
+        threatType:
+          type: array
+          items:
+            $ref: "#/components/schemas/ThreatType"
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status, limits, enums, captcha_strategy]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        captcha_strategy:
+          type: string
+          enum: [manual, auto]
+          description: manual waits for the operator. auto asks 2captcha and writes the token into the form.
+        limits:
+          $ref: "#/components/schemas/Limits"
+        enums:
+          $ref: "#/components/schemas/Enums"
+    FieldError:
+      type: object
+      additionalProperties: false
+      required: [loc, msg, type]
+      properties:
+        loc:
+          type: array
+          items:
+            oneOf:
+              - type: string
+              - type: integer
+        msg:
+          type: string
+        type:
+          type: string
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [detail]
+      properties:
+        detail:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/FieldError"
+    ErrorMessage:
+      type: object
+      additionalProperties: false
+      required: [detail]
+      properties:
+        detail:
+          type: string

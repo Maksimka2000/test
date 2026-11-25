@@ -1,0 +1,53 @@
+# docker compose up
+# Web UI: http://localhost:8080
+# API:    http://localhost:8000
+# The worker runs in the api container with CAPTCHA_STRATEGY from .env.
+# Auto captcha uses a headless browser. The 2captcha key stays in .env.
+
+name: bulk-report
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    user: "501:20"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      RUN_WORKER: "1"
+      WORKER_INTERVAL: "0.5"
+      BROWSER_HEADLESS: "1"
+      BROWSER_NO_SANDBOX: "1"
+      HOME: /tmp
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    shm_size: "1gb"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
