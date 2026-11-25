@@ -1,6 +1,6 @@
 
 
-
+0. create .env from the .env.example 
 ```bash
 cp .env.example .env
 ```
